@@ -25,7 +25,7 @@ POKEMON_NAMES = [
     "Electrode", "Exeggcute", "Exeggutor", "Cubone", "Marowak", "Hitmonlee",
     "Hitmonchan", "Lickitung", "Koffing", "Weezing", "Rhyhorn", "Rhydon", "Chansey",
     "Tangela", "Kangaskhan", "Horsea", "Seadra", "Goldeen", "Seaking", "Staryu",
-    "Starmie", "Mr. Mime", "Scyther", "Jynx", "Electabuzz", "Magmar", "Pinsir",
+    "Starmie", "MrMime", "Scyther", "Jynx", "Electabuzz", "Magmar", "Pinsir",
     "Tauros", "Magikarp", "Gyarados", "Lapras", "Ditto", "Eevee", "Vaporeon",
     "Jolteon", "Flareon", "Porygon", "Omanyte", "Omastar", "Kabuto", "Kabutops",
     "Aerodactyl", "Snorlax", "Articuno", "Zapdos", "Moltres", "Dratini",
@@ -36,7 +36,7 @@ def generate_nick():
     return f"{random.choice(POKEMON_NAMES)}{random.randint(100, 999)}"
 
 class CommandHub:
-    def __init__(self, hub_port, irc_server, irc_port, irc_channel, use_ssl=False, channel_password=None, server_password=None, use_ipv6=False):
+    def __init__(self, hub_port, irc_server, irc_port, irc_channel, use_ssl=False, channel_password=None, server_password=None):
         self.hub_port = hub_port
         self.leaf_bots = set()
         self.commands = {
@@ -52,7 +52,6 @@ class CommandHub:
             "use_ssl": use_ssl,
             "channel_password": channel_password,
             "password": server_password,
-            "use_ipv6": use_ipv6
         }
 
     async def handle_leaf_connection(self, reader, writer):
@@ -118,7 +117,6 @@ class CommandHub:
             self.config["channel"] = params[2]
             self.config["channel_password"] = params[3] if len(params) > 3 else None
             self.config["use_ssl"] = True if len(params) > 4 and params[4] == "-ssl" else False
-            self.config["use_ipv6"] = True if len(params) > 5 and params[5] == "-ipv6" else False
         logging.info(f"Updated configuration: {self.config}")
 
     async def broadcast_command(self, command, params):
@@ -126,14 +124,31 @@ class CommandHub:
             await self.execute_command(bot, command, params)
 
     async def run_hub_server(self):
-        server = await asyncio.start_server(
-            self.handle_leaf_connection, '::', self.hub_port, family=socket.AF_INET6, dualstack_ipv6=True)
+        servers = []
 
-        addr = server.sockets[0].getsockname()
-        logging.info(f'Serving on {addr}')
+        # Try to start IPv6 server
+        try:
+            server_ipv6 = await asyncio.start_server(
+                self.handle_leaf_connection, '::', self.hub_port, family=socket.AF_INET6)
+            servers.append(server_ipv6)
+            logging.info(f'Serving on IPv6: {server_ipv6.sockets[0].getsockname()}')
+        except Exception as e:
+            logging.warning(f"Failed to start server on IPv6: {e}")
 
-        async with server:
-            await server.serve_forever()
+        # Try to start IPv4 server
+        try:
+            server_ipv4 = await asyncio.start_server(
+                self.handle_leaf_connection, '0.0.0.0', self.hub_port, family=socket.AF_INET)
+            servers.append(server_ipv4)
+            logging.info(f'Serving on IPv4: {server_ipv4.sockets[0].getsockname()}')
+        except Exception as e:
+            logging.warning(f"Failed to start server on IPv4: {e}")
+
+        if not servers:
+            logging.error("Failed to start any servers. Exiting.")
+            return
+
+        await asyncio.gather(*(server.serve_forever() for server in servers))
 
     async def console_input(self):
         while True:
@@ -163,7 +178,6 @@ async def main(args):
         use_ssl=args.ssl,
         channel_password=args.key,
         server_password=args.password,
-        use_ipv6=args.ipv6
     )
     await hub_bot.run()
 
@@ -176,7 +190,6 @@ if __name__ == "__main__":
     parser.add_argument("--ssl", action="store_true", help="Use SSL for IRC connection")
     parser.add_argument("--key", help="The key (password) for the IRC channel, if required")
     parser.add_argument("--password", help="The password for the IRC server, if required")
-    parser.add_argument("--ipv6", action="store_true", help="Use IPv6 for IRC connection")
     args = parser.parse_args()
 
     if args.ssl and args.port == 6667:

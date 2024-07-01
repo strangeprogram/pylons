@@ -3,11 +3,20 @@ import json
 import ssl
 import logging
 import argparse
-import time
 import socket
 
 def ssl_ctx(verify: bool = False):
     return ssl.create_default_context() if verify else ssl._create_unverified_context()
+
+def get_ip_type(host, port):
+    try:
+        addrinfo = socket.getaddrinfo(host, port, proto=socket.IPPROTO_TCP)
+        if addrinfo[0][0] == socket.AF_INET6:
+            return socket.AF_INET6
+        else:
+            return socket.AF_INET
+    except socket.gaierror:
+        return socket.AF_INET  # Default to IPv4 if resolution fails
 
 class LeafBot:
     def __init__(self, hub_host, hub_port):
@@ -22,7 +31,6 @@ class LeafBot:
         self.nickname = None
         self.username = 'leafbot'
         self.realname = 'Leaf Bot'
-        self.last_command = time.time()
 
     async def connect_to_hub(self):
         try:
@@ -46,11 +54,12 @@ class LeafBot:
     async def connect_to_irc(self):
         while True:
             try:
+                ip_type = get_ip_type(self.config['server'], self.config['port'])
                 options = {
                     'host': self.config['server'],
                     'port': self.config['port'],
                     'ssl': ssl_ctx() if self.config['use_ssl'] else None,
-                    'family': socket.AF_INET6 if self.config['use_ipv6'] else socket.AF_INET,
+                    'family': ip_type,
                     'limit': 1024
                 }
                 self.irc_reader, self.irc_writer = await asyncio.wait_for(asyncio.open_connection(**options), 15)
@@ -89,24 +98,6 @@ class LeafBot:
         parts = data.split()
         if parts[0] == 'PING':
             await self.raw(f"PONG {parts[1]}")
-        elif parts[1] == 'PRIVMSG':
-            nick = parts[0].split('!')[0][1:]
-            target = parts[2]
-            msg = ' '.join(parts[3:])[1:]
-
-            if msg.startswith('!') and time.time() - self.last_command >= 3:
-                self.last_command = time.time()
-                command = msg.split()[0][1:]
-                if command in self.commands:
-                    await self.send_hub(json.dumps({
-                        "type": "command",
-                        "command": command,
-                        "params": msg.split()[1:]
-                    }))
-
-    async def send_hub(self, message):
-        self.hub_writer.write(f"{message}\r\n".encode())
-        await self.hub_writer.drain()
 
     async def handle_hub_message(self, message):
         data = json.loads(message)
@@ -148,6 +139,21 @@ class LeafBot:
             else:
                 await self.raw(f"JOIN {self.config['channel']}")
 
+    async def run_irc(self):
+        await self.connect_to_irc()
+        while True:
+            try:
+                data = await self.irc_reader.readline()
+                if not data:
+                    break
+                message = data.decode('utf-8').strip()
+                if message:
+                    await self.handle_irc_message(message)
+            except Exception as e:
+                logging.error(f"Error in IRC connection: {e}")
+                await asyncio.sleep(30)
+                await self.connect_to_irc()
+
     async def run_hub(self):
         while True:
             try:
@@ -162,7 +168,7 @@ class LeafBot:
     async def run(self):
         await self.connect_to_hub()
         await asyncio.gather(
-            self.connect_to_irc(),
+            self.run_irc(),
             self.run_hub()
         )
 
