@@ -4,6 +4,8 @@ import ssl
 import logging
 import argparse
 import socket
+import base64
+import os
 
 def ssl_ctx(verify: bool = False):
     return ssl.create_default_context() if verify else ssl._create_unverified_context()
@@ -18,6 +20,23 @@ def get_ip_type(host, port):
     except socket.gaierror:
         return socket.AF_INET  # Default to IPv4 if resolution fails
 
+class SimpleEncryption:
+    def __init__(self, key):
+        self.key = key
+
+    def encrypt(self, data):
+        encrypted = bytearray()
+        for i, char in enumerate(data):
+            encrypted.append(ord(char) ^ self.key[i % len(self.key)])
+        return base64.b64encode(encrypted).decode()
+
+    def decrypt(self, data):
+        encrypted = base64.b64decode(data)
+        decrypted = bytearray()
+        for i, byte in enumerate(encrypted):
+            decrypted.append(byte ^ self.key[i % len(self.key)])
+        return decrypted.decode()
+
 class LeafBot:
     def __init__(self, hub_host, hub_port):
         self.hub_host = hub_host
@@ -31,29 +50,60 @@ class LeafBot:
         self.nickname = None
         self.username = 'leafbot'
         self.realname = 'Leaf Bot'
+        self.encryption = None
 
     async def connect_to_hub(self):
-        try:
-            self.hub_reader, self.hub_writer = await asyncio.open_connection(self.hub_host, self.hub_port)
+        while True:
+            try:
+                logging.info(f"Attempting to connect to hub at {self.hub_host}:{self.hub_port}")
+                self.hub_reader, self.hub_writer = await asyncio.open_connection(self.hub_host, self.hub_port)
+                logging.info("Connection to hub established")
 
-            config_data = await self.hub_reader.readline()
-            self.config = json.loads(config_data.decode())
+                # Receive encryption key
+                logging.info("Waiting for encryption key...")
+                encryption_key = await asyncio.wait_for(self.hub_reader.readexactly(32), timeout=30)
+                logging.info(f"Received encryption key: {encryption_key.hex()}")
+                self.encryption = SimpleEncryption(encryption_key)
 
-            commands_data = await self.hub_reader.readline()
-            self.commands = json.loads(commands_data.decode())
+                logging.info("Waiting for encrypted config...")
+                encrypted_config = await asyncio.wait_for(self.hub_reader.readline(), timeout=30)
+                if not encrypted_config:
+                    raise ConnectionError("Failed to receive config from hub")
+                logging.info(f"Received encrypted config: {encrypted_config}")
+                decrypted_config = self.encryption.decrypt(encrypted_config.decode().strip())
+                logging.info(f"Decrypted config: {decrypted_config}")
+                self.config = json.loads(decrypted_config)
 
-            self.nickname = self.config.get('nickname', 'LeafBot')
+                logging.info("Waiting for encrypted commands...")
+                encrypted_commands = await asyncio.wait_for(self.hub_reader.readline(), timeout=30)
+                if not encrypted_commands:
+                    raise ConnectionError("Failed to receive commands from hub")
+                logging.info(f"Received encrypted commands: {encrypted_commands}")
+                decrypted_commands = self.encryption.decrypt(encrypted_commands.decode().strip())
+                logging.info(f"Decrypted commands: {decrypted_commands}")
+                self.commands = json.loads(decrypted_commands)
 
-            logging.info(f"Connected to hub at {self.hub_host}:{self.hub_port}")
-            logging.info(f"Received config: {self.config}")
-            logging.info(f"Received commands: {self.commands}")
-        except Exception as e:
-            logging.error(f"Failed to connect to hub: {e}")
-            raise
+                self.nickname = self.config.get('nickname', 'LeafBot')
+
+                logging.info(f"Successfully connected to hub at {self.hub_host}:{self.hub_port}")
+                logging.info(f"Received config: {self.config}")
+                logging.info(f"Received commands: {self.commands}")
+                return
+            except asyncio.TimeoutError:
+                logging.error("Timeout while connecting to hub")
+            except json.JSONDecodeError as e:
+                logging.error(f"Failed to parse JSON: {e}")
+            except Exception as e:
+                logging.error(f"Failed to connect to hub: {e}")
+            logging.info("Retrying connection to hub in 30 seconds...")
+            await asyncio.sleep(30)  # Wait before retry
 
     async def connect_to_irc(self):
         while True:
             try:
+                if not self.config:
+                    raise ValueError("Configuration not received from hub")
+
                 ip_type = get_ip_type(self.config['server'], self.config['port'])
                 options = {
                     'host': self.config['server'],
@@ -99,7 +149,8 @@ class LeafBot:
         if parts[0] == 'PING':
             await self.raw(f"PONG {parts[1]}")
 
-    async def handle_hub_message(self, message):
+    async def handle_hub_message(self, encrypted_message):
+        message = self.encryption.decrypt(encrypted_message)
         data = json.loads(message)
         if data['type'] == 'action':
             match data['action']:
@@ -140,47 +191,72 @@ class LeafBot:
                 await self.raw(f"JOIN {self.config['channel']}")
 
     async def run_irc(self):
-        await self.connect_to_irc()
         while True:
             try:
-                data = await self.irc_reader.readline()
-                if not data:
-                    break
-                message = data.decode('utf-8').strip()
-                if message:
-                    await self.handle_irc_message(message)
+                if not self.config:
+                    logging.info("Waiting for configuration from hub...")
+                    await asyncio.sleep(5)
+                    continue
+
+                await self.connect_to_irc()
+                while True:
+                    data = await self.irc_reader.readline()
+                    if not data:
+                        raise ConnectionResetError("IRC connection closed")
+                    message = data.decode('utf-8').strip()
+                    if message:
+                        await self.handle_irc_message(message)
             except Exception as e:
                 logging.error(f"Error in IRC connection: {e}")
                 await asyncio.sleep(30)
-                await self.connect_to_irc()
 
     async def run_hub(self):
         while True:
             try:
-                message = await self.hub_reader.readline()
-                message = message.decode().strip()
-                if message:
-                    await self.handle_hub_message(message)
+                await self.connect_to_hub()
+                while True:
+                    encrypted_message = await self.hub_reader.readline()
+                    if not encrypted_message:
+                        raise ConnectionResetError("Hub connection closed")
+                    message = encrypted_message.decode().strip()
+                    if message:
+                        await self.handle_hub_message(message)
             except Exception as e:
                 logging.error(f"Error in hub connection: {e}")
-                break
+                await asyncio.sleep(30)
 
     async def run(self):
-        await self.connect_to_hub()
-        await asyncio.gather(
-            self.run_irc(),
-            self.run_hub()
-        )
+        while True:
+            try:
+                # First, ensure we're connected to the hub and have the configuration
+                if not self.config:
+                    await self.connect_to_hub()
+                    continue  # Go back to the start of the loop to check if we have the config now
+
+                # Now that we have the config, run both IRC and hub connections
+                await asyncio.gather(
+                    self.run_irc(),
+                    self.run_hub()
+                )
+            except Exception as e:
+                logging.error(f"Unexpected error: {e}")
+                await asyncio.sleep(30)
 
 def setup_logger():
-    logging.basicConfig(level=logging.INFO,
+    logging.basicConfig(level=logging.DEBUG,  # Changed to DEBUG for more detailed logs
                         format='%(asctime)s | %(levelname)8s | %(message)s',
                         datefmt='%Y-%m-%d %H:%M:%S')
 
 async def main(hub_host, hub_port):
     setup_logger()
-    leaf_bot = LeafBot(hub_host, hub_port)
-    await leaf_bot.run()
+    while True:
+        try:
+            leaf_bot = LeafBot(hub_host, hub_port)
+            await leaf_bot.run()
+        except Exception as e:
+            logging.error(f"LeafBot crashed: {e}")
+            logging.info("Restarting LeafBot in 30 seconds...")
+            await asyncio.sleep(30)
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Leaf Bot for IRC")

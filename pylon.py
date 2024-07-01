@@ -5,6 +5,8 @@ import logging
 import argparse
 import socket
 import ssl
+import base64
+import os
 
 POKEMON_NAMES = [
     "Bulbasaur", "Ivysaur", "Venusaur", "Charmander", "Charmeleon", "Charizard",
@@ -35,6 +37,23 @@ POKEMON_NAMES = [
 def generate_nick():
     return f"{random.choice(POKEMON_NAMES)}{random.randint(100, 999)}"
 
+class SimpleEncryption:
+    def __init__(self, key):
+        self.key = key
+
+    def encrypt(self, data):
+        encrypted = bytearray()
+        for i, char in enumerate(data):
+            encrypted.append(ord(char) ^ self.key[i % len(self.key)])
+        return base64.b64encode(encrypted).decode()
+
+    def decrypt(self, data):
+        encrypted = base64.b64decode(data)
+        decrypted = bytearray()
+        for i, byte in enumerate(encrypted):
+            decrypted.append(byte ^ self.key[i % len(self.key)])
+        return decrypted.decode()
+
 class CommandHub:
     def __init__(self, hub_port, irc_server, irc_port, irc_channel, use_ssl=False, channel_password=None, server_password=None):
         self.hub_port = hub_port
@@ -53,18 +72,26 @@ class CommandHub:
             "channel_password": channel_password,
             "password": server_password,
         }
+        self.encryption_key = os.urandom(32)
+        self.encryption = SimpleEncryption(self.encryption_key)
 
     async def handle_leaf_connection(self, reader, writer):
         addr = writer.get_extra_info('peername')
         logging.info(f"New leaf bot connected: {addr}")
 
+        # Send encryption key
+        writer.write(self.encryption_key)
+        await writer.drain()
+
         leaf_config = self.config.copy()
         leaf_config["nickname"] = generate_nick()
 
-        writer.write(json.dumps(leaf_config).encode() + b'\n')
+        encrypted_config = self.encryption.encrypt(json.dumps(leaf_config))
+        writer.write(encrypted_config.encode() + b'\n')
         await writer.drain()
 
-        writer.write(json.dumps(self.commands).encode() + b'\n')
+        encrypted_commands = self.encryption.encrypt(json.dumps(self.commands))
+        writer.write(encrypted_commands.encode() + b'\n')
         await writer.drain()
 
         self.leaf_bots.add(writer)
@@ -73,7 +100,8 @@ class CommandHub:
                 data = await reader.readline()
                 if not data:
                     break
-                message = data.decode().strip()
+                encrypted_message = data.decode().strip()
+                message = self.encryption.decrypt(encrypted_message)
                 logging.info(f"Received from leaf bot {addr}: {message}")
                 await self.process_leaf_message(writer, message)
         finally:
@@ -107,7 +135,8 @@ class CommandHub:
             case _:
                 response = {"type": "error", "message": "Unknown command"}
 
-        writer.write(json.dumps(response).encode() + b'\n')
+        encrypted_response = self.encryption.encrypt(json.dumps(response))
+        writer.write(encrypted_response.encode() + b'\n')
         await writer.drain()
 
     def update_config(self, params):
