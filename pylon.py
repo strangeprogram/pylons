@@ -7,6 +7,8 @@ import socket
 import ssl
 import base64
 import os
+import inspect
+import importlib
 
 POKEMON_NAMES = [
     "Bulbasaur", "Ivysaur", "Venusaur", "Charmander", "Charmeleon", "Charizard",
@@ -54,17 +56,25 @@ class SimpleEncryption:
             decrypted.append(byte ^ self.key[i % len(self.key)])
         return decrypted.decode()
 
+class BasePlugin:
+    def __init__(self, bot):
+        self.bot = bot
+
+    async def on_command(self, sender, channel, command, args):
+        pass
+
+    @property
+    def commands(self):
+        return {}
+
 class CommandHub:
-    def __init__(self, hub_port, irc_server, irc_port, irc_channel, use_ssl=False, channel_password=None, server_password=None):
-        self.hub_port = hub_port
-        self.leaf_bots = set()
-        self.commands = {
-            "test": "Send a test message to the channel",
-            "join": "Join a new channel",
-            "leave": "Leave a channel",
-            "nick": "Change nickname"
+    def __init__(self, hub_address, hub_port, irc_server, irc_port, irc_channel, use_ssl=False, channel_password=None, server_password=None):
+        self.hub_config = {
+            "address": hub_address,
+            "port": hub_port,
         }
-        self.config = {
+        self.leaf_bots = set()
+        self.irc_config = {
             "server": irc_server,
             "port": irc_port,
             "channel": irc_channel,
@@ -74,16 +84,41 @@ class CommandHub:
         }
         self.encryption_key = os.urandom(32)
         self.encryption = SimpleEncryption(self.encryption_key)
+        self.plugins = []
+        self.commands = {
+            "test": "Send a test message to the channel",
+            "join": "Join a new channel",
+            "leave": "Leave a channel",
+            "nick": "Change nickname",
+            "UPDATECONF": "Update hub configuration",
+            "UPDATECONF.IRC": "Update IRC configuration"
+        }
+        self.load_plugins()
+
+    def load_plugins(self):
+        new_plugins = []
+        plugins_dir = os.path.join(os.path.dirname(__file__), "plugins")
+        for filename in os.listdir(plugins_dir):
+            if filename.endswith(".py") and not filename.startswith("__"):
+                module_name = f"plugins.{filename[:-3]}"
+                module = importlib.import_module(module_name)
+                for name, obj in inspect.getmembers(module):
+                    if inspect.isclass(obj) and issubclass(obj, BasePlugin) and obj != BasePlugin:
+                        plugin = obj(self)
+                        self.plugins.append(plugin)
+                        self.commands.update(plugin.commands)
+                        new_plugins.append(name)
+                        logging.info(f"Loaded new plugin: {name}")
+        return new_plugins
 
     async def handle_leaf_connection(self, reader, writer):
         addr = writer.get_extra_info('peername')
         logging.info(f"New leaf bot connected: {addr}")
 
-        # Send encryption key
         writer.write(self.encryption_key)
         await writer.drain()
 
-        leaf_config = self.config.copy()
+        leaf_config = self.irc_config.copy()
         leaf_config["nickname"] = generate_nick()
 
         encrypted_config = self.encryption.encrypt(json.dumps(leaf_config))
@@ -114,43 +149,66 @@ class CommandHub:
         try:
             data = json.loads(message)
             if data['type'] == 'command':
-                await self.execute_command(writer, data['command'], data.get('params', []))
+                response = await self.execute_command(data['sender'], data['channel'], data['command'], data.get('args', []))
+                encrypted_response = self.encryption.encrypt(json.dumps(response))
+                writer.write(encrypted_response.encode() + b'\n')
+                await writer.drain()
         except json.JSONDecodeError:
             logging.error(f"Received invalid JSON from leaf bot: {message}")
 
-    async def execute_command(self, writer, command, params):
-        match command:
-            case 'test':
-                response = {"type": "action", "action": "send_message", "message": "Test message from hub"}
-            case 'join':
-                response = {"type": "action", "action": "join_channel", "channel": params[0]}
-            case 'leave':
-                response = {"type": "action", "action": "leave_channel", "channel": params[0]}
-            case 'nick':
+    async def execute_command(self, sender, channel, command, args):
+        if command in self.commands:
+            if command == "test":
+                return {"type": "action", "action": "send_message", "channel": channel, "message": "Test message from hub"}
+            elif command == "join":
+                return {"type": "action", "action": "join_channel", "channel": args[0] if args else channel}
+            elif command == "leave":
+                return {"type": "action", "action": "leave_channel", "channel": args[0] if args else channel}
+            elif command == "nick":
                 new_nick = generate_nick()
-                response = {"type": "action", "action": "change_nick", "nickname": new_nick}
-            case 'UPDATECONF':
-                self.update_config(params)
-                response = {"type": "action", "action": "update_config", "config": self.config}
-            case _:
-                response = {"type": "error", "message": "Unknown command"}
+                return {"type": "action", "action": "change_nick", "nickname": new_nick}
+            elif command == "UPDATECONF":
+                return self.update_hub_config(args)
+            elif command == "UPDATECONF.IRC":
+                return self.update_irc_config(args)
+            else:
+                for plugin in self.plugins:
+                    result = await plugin.on_command(sender, channel, command, args)
+                    if result:
+                        return result
+        return {"type": "error", "message": "Unknown command"}
 
-        encrypted_response = self.encryption.encrypt(json.dumps(response))
-        writer.write(encrypted_response.encode() + b'\n')
-        await writer.drain()
+    def update_hub_config(self, params):
+        if len(params) >= 2:
+            self.hub_config["address"] = params[0]
+            self.hub_config["port"] = int(params[1])
+        elif len(params) == 1:
+            if params[0].isdigit():
+                self.hub_config["port"] = int(params[0])
+            else:
+                self.hub_config["address"] = params[0]
+        logging.info(f"Updated hub configuration: {self.hub_config}")
+        return {"type": "action", "action": "update_hub_config", "config": self.hub_config}
 
-    def update_config(self, params):
+    def update_irc_config(self, params):
         if len(params) >= 3:
-            self.config["server"] = params[0]
-            self.config["port"] = int(params[1])
-            self.config["channel"] = params[2]
-            self.config["channel_password"] = params[3] if len(params) > 3 else None
-            self.config["use_ssl"] = True if len(params) > 4 and params[4] == "-ssl" else False
-        logging.info(f"Updated configuration: {self.config}")
+            self.irc_config["server"] = params[0]
+            self.irc_config["port"] = int(params[1])
+            self.irc_config["channel"] = params[2]
+            self.irc_config["channel_password"] = params[3] if len(params) > 3 else None
+            self.irc_config["use_ssl"] = True if len(params) > 4 and params[4] == "-ssl" else False
+        logging.info(f"Updated IRC configuration: {self.irc_config}")
+        return {"type": "action", "action": "update_irc_config", "config": self.irc_config}
 
     async def broadcast_command(self, command, params):
+        response = await self.execute_command("Console", "Hub", command, params)
+        encrypted_response = self.encryption.encrypt(json.dumps(response))
         for bot in self.leaf_bots:
-            await self.execute_command(bot, command, params)
+            try:
+                bot.write(encrypted_response.encode() + b'\n')
+                await bot.drain()
+            except Exception as e:
+                logging.error(f"Error broadcasting command to leaf bot: {e}")
 
     async def run_hub_server(self):
         servers = []
@@ -158,7 +216,7 @@ class CommandHub:
         # Try to start IPv6 server
         try:
             server_ipv6 = await asyncio.start_server(
-                self.handle_leaf_connection, '::', self.hub_port, family=socket.AF_INET6)
+                self.handle_leaf_connection, '::', self.hub_config['port'], family=socket.AF_INET6)
             servers.append(server_ipv6)
             logging.info(f'Serving on IPv6: {server_ipv6.sockets[0].getsockname()}')
         except Exception as e:
@@ -167,7 +225,7 @@ class CommandHub:
         # Try to start IPv4 server
         try:
             server_ipv4 = await asyncio.start_server(
-                self.handle_leaf_connection, '0.0.0.0', self.hub_port, family=socket.AF_INET)
+                self.handle_leaf_connection, self.hub_config['address'], self.hub_config['port'], family=socket.AF_INET)
             servers.append(server_ipv4)
             logging.info(f'Serving on IPv4: {server_ipv4.sockets[0].getsockname()}')
         except Exception as e:
@@ -181,10 +239,15 @@ class CommandHub:
 
     async def console_input(self):
         while True:
-            command = await asyncio.get_event_loop().run_in_executor(None, input, "Enter command: ")
-            parts = command.split()
-            if parts:
-                await self.broadcast_command(parts[0], parts[1:])
+            try:
+                command = await asyncio.get_event_loop().run_in_executor(None, input, "Enter command: ")
+                parts = command.split()
+                if parts:
+                    await self.broadcast_command(parts[0], parts[1:])
+                else:
+                    logging.warning("Empty command entered")
+            except Exception as e:
+                logging.error(f"Error processing console input: {e}")
 
     async def run(self):
         await asyncio.gather(
@@ -199,19 +262,27 @@ def setup_logger():
 
 async def main(args):
     setup_logger()
-    hub_bot = CommandHub(
-        args.hub_port,
-        args.server,
-        args.port,
-        args.channel,
-        use_ssl=args.ssl,
-        channel_password=args.key,
-        server_password=args.password,
-    )
-    await hub_bot.run()
+    while True:
+        try:
+            hub_bot = CommandHub(
+                args.hub_address,
+                args.hub_port,
+                args.server,
+                args.port,
+                args.channel,
+                use_ssl=args.ssl,
+                channel_password=args.key,
+                server_password=args.password,
+            )
+            await hub_bot.run()
+        except Exception as e:
+            logging.error(f"HubBot crashed: {e}")
+            logging.info("Restarting HubBot in 30 seconds...")
+            await asyncio.sleep(30)
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="IRC Hub Bot")
+    parser.add_argument("--hub-address", default="0.0.0.0", help="Address for the hub to listen on")
     parser.add_argument("--hub-port", type=int, default=8888, help="Port for the hub to listen on")
     parser.add_argument("--server", required=True, help="The IRC server address")
     parser.add_argument("--port", type=int, default=6667, help="The IRC server port")
