@@ -32,6 +32,7 @@ This project implements a flexible and extensible IRC bot network using a hub-an
 3. The hub bot manages all leaf bots, broadcasting commands and updates as necessary.
 4. Leaf bots connect to IRC servers and channels based on their configuration from the hub.
 5. Commands entered in the hub are executed across all connected leaf bots.
+6. Dynamic Plugin creation that allows on the fly unloading and loading to broadcast new configurations to the links
 
 ## Command List
 
