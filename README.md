@@ -1,7 +1,7 @@
 # pylons
 modern async eggdrop in pure python
 
-# IRC Bot Network: Hub and Leaf System
+# Pylons: IRC Hub and Leaf System
 
 ## Overview
 
@@ -48,13 +48,13 @@ This project implements a flexible and extensible IRC bot network using a hub-an
 
 1. Clone the repository:
    ```
-   git clone https://github.com/yourusername/irc-bot-network.git
-   cd irc-bot-network
+   git clone https://github.com/strangeprogram/pylons.git
+   cd pylons
    ```
 
 2. Run the hub bot:
    ```
-   python hub_bot.py --hub-address 0.0.0.0 --hub-port 8888 --server irc.example.com --port 6667 --channel "#your-channel"
+   python pylon.py --hub-address 0.0.0.0 --hub-port 8888 --server irc.example.com --port 6667 --channel "#your-channel"
    ```
 
    Add `--ssl` if your IRC server uses SSL.
@@ -63,7 +63,7 @@ This project implements a flexible and extensible IRC bot network using a hub-an
 
 1. Run the leaf bot, pointing it to your hub:
    ```
-   python leaf_bot.py hub.example.com 8888
+   python shard.py hub.example.com 8888
    ```
 
    Replace `hub.example.com` with the address of your hub bot.
