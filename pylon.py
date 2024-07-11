@@ -15,7 +15,7 @@ POKEMON_NAMES = [
     "Squirtle", "Wartortle", "Blastoise", "Caterpie", "Metapod", "Butterfree",
     "Weedle", "Kakuna", "Beedrill", "Pidgey", "Pidgeotto", "Pidgeot", "Rattata",
     "Raticate", "Spearow", "Fearow", "Ekans", "Arbok", "Pikachu", "Raichu",
-    "Sandshrew", "Sandslash", "Nidoran♀", "Nidorina", "Nidoqueen", "Nidoran♂",
+    "Sandshrew", "Sandslash", "Nidoran", "Nidorina", "Nidoqueen", "Nidoran♂",
     "Nidorino", "Nidoking", "Clefairy", "Clefable", "Vulpix", "Ninetales",
     "Jigglypuff", "Wigglytuff", "Zubat", "Golbat", "Oddish", "Gloom", "Vileplume",
     "Paras", "Parasect", "Venonat", "Venomoth", "Diglett", "Dugtrio", "Meowth",
@@ -93,6 +93,7 @@ class CommandHub:
             "UPDATECONF": "Update hub configuration",
             "UPDATECONF.IRC": "Update IRC configuration"
         }
+        self.used_nicks = {}
         self.load_plugins()
 
     def load_plugins(self):
@@ -111,6 +112,18 @@ class CommandHub:
                         logging.info(f"Loaded new plugin: {name}")
         return new_plugins
 
+    def generate_unique_nick(self, base_nick):
+        count = 0
+        while f"{base_nick}{count if count else ''}" in self.used_nicks:
+            count += 1
+        new_nick = f"{base_nick}{count if count else ''}"
+        self.used_nicks[new_nick] = new_nick
+        return new_nick
+
+    def release_nick(self, nick):
+        if nick in self.used_nicks:
+            del self.used_nicks[nick]
+
     async def handle_leaf_connection(self, reader, writer):
         addr = writer.get_extra_info('peername')
         logging.info(f"New leaf bot connected: {addr}")
@@ -119,7 +132,7 @@ class CommandHub:
         await writer.drain()
 
         leaf_config = self.irc_config.copy()
-        leaf_config["nickname"] = generate_nick()
+        leaf_config["nickname"] = self.generate_unique_nick(generate_nick())
 
         encrypted_config = self.encryption.encrypt(json.dumps(leaf_config))
         writer.write(encrypted_config.encode() + b'\n')
@@ -153,29 +166,51 @@ class CommandHub:
                 encrypted_response = self.encryption.encrypt(json.dumps(response))
                 writer.write(encrypted_response.encode() + b'\n')
                 await writer.drain()
+            elif data['type'] == 'nick_update':
+                if 'old_nick' in data:
+                    self.release_nick(data['old_nick'])
+                if 'new_nick' in data:
+                    new_nick = self.generate_unique_nick(data['new_nick'])
+                    response = {"type": "action", "action": "set_nick", "nickname": new_nick}
+                    encrypted_response = self.encryption.encrypt(json.dumps(response))
+                    writer.write(encrypted_response.encode() + b'\n')
+                    await writer.drain()
+            elif data['type'] == 'alert':
+                logging.warning(f"Alert from leaf bot: {data['message']}")
+            else:
+                logging.warning(f"Unknown message type from leaf bot: {data['type']}")
         except json.JSONDecodeError:
             logging.error(f"Received invalid JSON from leaf bot: {message}")
+        except Exception as e:
+            logging.error(f"Error processing leaf message: {e}")
 
     async def execute_command(self, sender, channel, command, args):
-        if command in self.commands:
-            if command == "test":
-                return {"type": "action", "action": "send_message", "channel": channel, "message": "Test message from hub"}
-            elif command == "join":
-                return {"type": "action", "action": "join_channel", "channel": args[0] if args else channel}
-            elif command == "leave":
-                return {"type": "action", "action": "leave_channel", "channel": args[0] if args else channel}
-            elif command == "nick":
-                new_nick = generate_nick()
-                return {"type": "action", "action": "change_nick", "nickname": new_nick}
-            elif command == "UPDATECONF":
-                return self.update_hub_config(args)
-            elif command == "UPDATECONF.IRC":
-                return self.update_irc_config(args)
-            else:
-                for plugin in self.plugins:
-                    result = await plugin.on_command(sender, channel, command, args)
-                    if result:
-                        return result
+        if command == "test":
+            return {"type": "action", "action": "send_message", "channel": self.irc_config['channel'], "message": "Test message from hub"}
+        elif command == "join":
+            return {"type": "action", "action": "join_channel", "channel": args[0] if args else channel}
+        elif command == "leave":
+            return {"type": "action", "action": "leave_channel", "channel": args[0] if args else channel}
+        elif command == "nick":
+            new_nick = self.generate_unique_nick(generate_nick())
+            return {"type": "action", "action": "change_nick", "nickname": new_nick}
+        elif command == "request_nick":
+            base_nick = args[0] if args else generate_nick()
+            new_nick = self.generate_unique_nick(base_nick)
+            return {"type": "action", "action": "set_nick", "nickname": new_nick}
+        elif command == "release_nick":
+            if args:
+                self.release_nick(args[0])
+            return {"type": "action", "action": "nick_released"}
+        elif command == "UPDATECONF":
+            return self.update_hub_config(args)
+        elif command == "UPDATECONF.IRC":
+            return self.update_irc_config(args)
+        else:
+            for plugin in self.plugins:
+                result = await plugin.on_command(sender, channel, command, args)
+                if result:
+                    return result
         return {"type": "error", "message": "Unknown command"}
 
     def update_hub_config(self, params):
@@ -255,13 +290,14 @@ class CommandHub:
             self.console_input()
         )
 
-def setup_logger():
-    logging.basicConfig(level=logging.INFO,
+def setup_logger(debug=False):
+    level = logging.DEBUG if debug else logging.INFO
+    logging.basicConfig(level=level,
                         format='%(asctime)s | %(levelname)8s | %(message)s',
                         datefmt='%Y-%m-%d %H:%M:%S')
 
 async def main(args):
-    setup_logger()
+    setup_logger(args.debug)
     while True:
         try:
             hub_bot = CommandHub(
@@ -290,9 +326,17 @@ if __name__ == "__main__":
     parser.add_argument("--ssl", action="store_true", help="Use SSL for IRC connection")
     parser.add_argument("--key", help="The key (password) for the IRC channel, if required")
     parser.add_argument("--password", help="The password for the IRC server, if required")
+    parser.add_argument("--debug", action="store_true", help="Enable debug mode")
     args = parser.parse_args()
 
     if args.ssl and args.port == 6667:
         args.port = 6697  # Default SSL port
 
-    asyncio.run(main(args))
+    try:
+        asyncio.run(main(args))
+    except KeyboardInterrupt:
+        print("Hub bot stopped by user.")
+    except Exception as e:
+        logging.error(f"Fatal error in main loop: {e}")
+        import traceback
+        traceback.print_exc()
